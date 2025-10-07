@@ -1,6 +1,3 @@
-# ----------------------------------------------------
-# 🌊 DeepReef AI - FastAPI Backend
-# ----------------------------------------------------
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -8,80 +5,45 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.preprocessing import image
-from sklearn.preprocessing import LabelEncoder
 import joblib
-import io
+from sklearn.preprocessing import LabelEncoder
 from PIL import Image
+import io
+import google.generativeai as genai
 
-# ----------------------------------------------------
-# 1️⃣ Initialize FastAPI App
-# ----------------------------------------------------
-app = FastAPI(title="DeepReef AI Backend", description="Predict coral health and bleaching severity")
+# ————— Gemini API key (hardcoded, for testing) —————
+GEMINI_API_KEY = "AIzaSyDqomTOI7QIcr-bfGP9dLclAW_03n85JuY"
+genai.configure(api_key=GEMINI_API_KEY)
 
-# Enable CORS (so your frontend can talk to backend)
+# ————— FastAPI setup —————
+app = FastAPI(title="DeepReef + Gemini 2.5")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to your frontend domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------------------------------------
-# 2️⃣ Load Trained Models
-# ----------------------------------------------------
-# CNN Model (MobileNetV2)
-cnn_model_path = "coral_mobilenet_best.h5"
-cnn_model = tf.keras.models.load_model(cnn_model_path)
+# ————— Load models & metadata —————
+cnn_model = tf.keras.models.load_model("coral_mobilenet_best.h5")
+rf = joblib.load("coral_bleaching_model.pkl")
+label_encoder: LabelEncoder = joblib.load("label_encoder.pkl")
+X_train_columns = joblib.load("train_columns.pkl")
 
-# Random Forest Model and Encoder
-rf_model_path = "coral_bleaching_model.pkl"       # <-- replace with your RF model filename
-encoder_path = "label_encoder.pkl"              # <-- replace with your label encoder filename
-train_columns_path = "train_columns.pkl"        # <-- to maintain one-hot column order
-
-rf = joblib.load(rf_model_path)
-label_encoder: LabelEncoder = joblib.load(encoder_path)
-X_train_columns = joblib.load(train_columns_path)  # list of training columns
-
-# ----------------------------------------------------
-# 3️⃣ Utility: Preprocess Coral Image
-# ----------------------------------------------------
-def preprocess_image(uploaded_file):
+def preprocess_image(uploaded_file: UploadFile):
     TARGET_SIZE = (160, 160)
-    image_bytes = uploaded_file.file.read()
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_bytes = uploaded_file.file.read()
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img = img.resize(TARGET_SIZE)
-    img_array = image.img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    img_array = tf.keras.applications.mobilenet_v2.preprocess_input(img_array)
-    return img_array
+    arr = image.img_to_array(img)
+    arr = np.expand_dims(arr, axis=0)
+    arr = tf.keras.applications.mobilenet_v2.preprocess_input(arr)
+    return arr
 
-# ----------------------------------------------------
-# 4️⃣ Endpoint: Predict Coral Health (Image)
-# ----------------------------------------------------
-@app.post("/predict_image")
-async def predict_image(file: UploadFile = File(...)):
-    try:
-        img_array = preprocess_image(file)
-        pred = cnn_model.predict(img_array)[0]
-        class_labels = ['Bleached Coral', 'Healthy Coral']
-        pred_index = np.argmax(pred)
-        confidence = float(pred[pred_index])
-        label = class_labels[pred_index]
-
-        return {
-            "prediction": label,
-            "confidence": round(confidence * 100, 2)
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-# ----------------------------------------------------
-# 5️⃣ Endpoint: Predict Bleaching Severity (Form Inputs)
-# ----------------------------------------------------
-@app.post("/predict_severity")
-async def predict_severity(
+@app.post("/analyze_coral")
+async def analyze_coral(
+    file: UploadFile = File(...),
     Temperature_Mean: float = Form(...),
     Windspeed: float = Form(...),
     TSA: float = Form(...),
@@ -89,49 +51,62 @@ async def predict_severity(
     Exposure: str = Form(...)
 ):
     try:
-        # Create DataFrame
-        new_site = pd.DataFrame([{
+        # CNN inference
+        arr = preprocess_image(file)
+        preds = cnn_model.predict(arr)[0]
+        class_labels = ['Bleached Coral', 'Healthy Coral']
+        idx = int(np.argmax(preds))
+        coral_status = class_labels[idx]
+        confidence = float(preds[idx])
+
+        # RF inference
+        df = pd.DataFrame([{
             'Temperature_Mean': Temperature_Mean,
             'Windspeed': Windspeed,
             'TSA': TSA,
             'Ocean_Name': Ocean_Name,
             'Exposure': Exposure
         }])
-
-        # One-hot encode
-        new_encoded = pd.get_dummies(new_site, columns=['Ocean_Name', 'Exposure'], drop_first=True)
-
-        # Add missing columns
+        df_enc = pd.get_dummies(df, columns=['Ocean_Name', 'Exposure'], drop_first=True)
         for col in X_train_columns:
-            if col not in new_encoded.columns:
-                new_encoded[col] = 0
+            if col not in df_enc.columns:
+                df_enc[col] = 0
+        df_enc = df_enc[X_train_columns]
+        severity_pred = rf.predict(df_enc)
+        severity = label_encoder.inverse_transform(severity_pred)[0]
 
-        # Align order
-        new_encoded = new_encoded[X_train_columns]
+        # Compose Gemini prompt
+        prompt = f"""
+        Coral image result: {coral_status} (confidence: {confidence*100:.2f}%).
+        Environmental parameters:
+         • Temperature_Mean = {Temperature_Mean}
+         • Windspeed = {Windspeed}
+         • TSA = {TSA}
+         • Ocean_Name = {Ocean_Name}, Exposure = {Exposure}
+        RF bleaching severity: {severity}.
 
-        # Predict
-        pred_label = rf.predict(new_encoded)
-        pred_class = label_encoder.inverse_transform(pred_label)
+        Provide a concise scientific summary (3-4 sentences) interpreting these findings,
+        possible explanations, and risk assessment.
+        """
+
+        # Call Gemini 2.5 Flash
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        gemini_resp = model.generate_content(prompt)
+        summary = gemini_resp.text
 
         return {
-            "bleaching_severity": pred_class[0]
+            "image_prediction": coral_status,
+            "confidence": round(confidence * 100, 2),
+            "bleaching_severity": severity,
+            "gemini_summary": summary
         }
 
     except Exception as e:
         return {"error": str(e)}
 
-# ----------------------------------------------------
-# 6️⃣ Root Endpoint
-# ----------------------------------------------------
 @app.get("/")
 def root():
-    return {
-        "message": "Welcome to DeepReef AI 🌊",
-        "endpoints": ["/predict_image", "/predict_severity"]
-    }
+    return {"message": "DeepReef + Gemini 2.5 ready", "endpoint": "/analyze_coral"}
 
-# ----------------------------------------------------
-# 7️⃣ Run the Server
-# ----------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
