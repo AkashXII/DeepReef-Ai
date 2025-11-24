@@ -11,6 +11,7 @@ from PIL import Image
 import io
 import google.generativeai as genai
 
+
 # ————— Gemini API key (hardcoded, for testing) —————
 GEMINI_API_KEY = "AIzaSyDqomTOI7QIcr-bfGP9dLclAW_03n85JuY"
 genai.configure(api_key=GEMINI_API_KEY)
