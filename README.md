@@ -1,2 +1,2 @@
-Description about the DeepReef AI — Coral Health & Bleaching Prediction System is available in SubZero branch.
+Description about the DeepReef AI — Coral Health & Bleaching Prediction System is available in Subzero branch.
 
